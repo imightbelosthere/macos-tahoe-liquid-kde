@@ -704,6 +704,20 @@ def _current_wallpapers() -> list[dict[str, object]]:
     return live or _wallpapers_from_config()
 
 
+def _capture_wallpapers_with_retry(*, attempts: int = 4,
+                                   wait_seconds: int = 5) -> list:
+    # WALLPAPER-NO-STOMP-GUARD (1/3): an empty capture during
+    # session restore is a timing artifact, not the truth about
+    # the desktop (macos-tahoe-deploy step 3b).
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(wait_seconds)
+        current = _current_wallpapers()
+        if current:
+            return current
+    return []
+
+
 def _build_wallpaper_apply_script(
         snapshot: list[dict[str, object]]) -> str:
     by_screen = {
@@ -830,7 +844,10 @@ def _apply_wallpaper(
     existing_env = _env_bool("MTTKDE_EXISTING_INSTALL")
     existing = (was_initialized or context != "install") \
         if existing_env is None else existing_env
-    current = (_current_wallpapers() if current_snapshot is None
+    # WALLPAPER-NO-STOMP-GUARD (4/4): every read goes through the retry
+    # wrapper — a single empty answer is never trusted.
+    current = (_capture_wallpapers_with_retry()
+               if current_snapshot is None
                else _normalize_wallpaper_snapshot(current_snapshot))
     last_applied = _normalize_wallpaper_snapshot(state.get("last_applied"))
     user_screens = set(_normalize_wallpaper_screens(
@@ -849,6 +866,21 @@ def _apply_wallpaper(
         state["last_applied"] = current
         _save_wallpaper_state(state)
         return True
+
+    if not current:
+        # WALLPAPER-NO-STOMP-GUARD (3/3): still empty after
+        # retries. An unknown desktop is NEVER grounds to
+        # re-assert the theme wallpaper; only a genuinely fresh
+        # box (no saved desktop config / first install) keeps
+        # upstream's apply-on-empty behavior.
+        appletsrc = (_xdg_config()
+                     / "plasma-org.kde.plasma.desktop-appletsrc")
+        if (appletsrc.is_file()
+                and (context != "install" or was_initialized)):
+            print("wallpaper: capture failed after retries"
+                  " — desktop state unknown, leaving wallpapers"
+                  " untouched", file=sys.stderr)
+            return True
 
     if reset:
         user_screens.clear()
@@ -1434,7 +1466,7 @@ def _apply_unlocked(mode: str, context: str = "user") -> bool:
     # Capture before the live look-and-feel apply.  Even if a third-party LAF
     # carries wallpaper defaults, it must not erase the outgoing custom choice
     # before our per-mode state has seen it.
-    wallpaper_before = _current_wallpapers()
+    wallpaper_before = _capture_wallpapers_with_retry()  # WALLPAPER-NO-STOMP-GUARD (2/3)
 
     # Apply the live look-and-feel while Plasma still sees the outgoing
     # package in kdeglobals.  Writing the target package first can make the

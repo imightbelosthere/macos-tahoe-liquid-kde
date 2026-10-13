@@ -150,6 +150,8 @@ def test_color_scheme_hash_tracks_active_scheme(seeded_color_schemes, offline):
 def _stub_apply_dependencies(monkeypatch, calls):
     import theme_switch
     monkeypatch.setattr(theme_switch, "_current_wallpapers", lambda: [])
+    monkeypatch.setattr(theme_switch, "_capture_wallpapers_with_retry",
+                        theme_switch._current_wallpapers)
     monkeypatch.setattr(theme_switch, "write_kde_theme_config",
                         lambda mode, **kw:
                         calls.append(("write", mode, kw)) or True)
@@ -822,6 +824,8 @@ _APPLY_SUBCALLS = (
 def _stub_apply_subcalls(monkeypatch, calls, ret=True):
     import theme_switch
     monkeypatch.setattr(theme_switch, "_current_wallpapers", lambda: [])
+    monkeypatch.setattr(theme_switch, "_capture_wallpapers_with_retry",
+                        theme_switch._current_wallpapers)
     for fn in _APPLY_SUBCALLS:
         monkeypatch.setattr(
             theme_switch, fn,
@@ -1264,6 +1268,69 @@ def test_apply_fails_when_config_writes_fail(monkeypatch):
                         lambda mode, **kwargs: True)
     monkeypatch.setattr(theme_switch, "_apply_local_extras", lambda mode: True)
     assert theme_switch.apply("dark") is True
+
+
+def test_boot_capture_empty_never_reasserts_theme_wallpaper(monkeypatch, tmp_path):
+    """Session-start race (#95): while plasmashell is still restoring its
+    containments both capture reads can answer EMPTY. An empty capture must
+    be treated as UNKNOWN, never as "nothing is user-owned" — otherwise the
+    unconditional theme re-assert erases the user wallpaper at every login."""
+    ts, theme = _smart_wallpaper_env(monkeypatch, tmp_path)
+    user = _wp("file:///pictures/keep-me.jpg")
+    (ts._xdg_config() / "plasma-org.kde.plasma.desktop-appletsrc").write_text(
+        "[Containments][1]\nplugin=org.kde.plasma.folder\nlastScreen=0\n\n"
+        "[Containments][1][Wallpaper][org.kde.image][General]\n"
+        f"Image={user[0]['image']}\n")
+    ts._save_wallpaper_state({
+        "version": ts._WALLPAPER_STATE_VERSION,
+        "initialized": True, "enabled": True,
+        "user_screens": [], "last_applied": _wp(f"file://{theme}"),
+    })
+    monkeypatch.setenv("FEAT_WALLPAPERS", "true")
+    monkeypatch.setattr(ts, "_current_wallpapers", lambda: [])
+    monkeypatch.setattr(ts.time, "sleep", lambda _s: None)
+    for fn in ("_apply_theme_wallpaper", "_apply_wallpaper_snapshot"):
+        monkeypatch.setattr(
+            ts, fn,
+            lambda *_a, **_k: (_ for _ in ()).throw(
+                AssertionError("empty boot capture must not touch wallpapers")))
+
+    assert ts._apply_wallpaper("dark", context="user") is True
+    # state untouched = the unknown-state early return, not a rewrite
+    assert ts._load_wallpaper_state()["last_applied"] == _wp(f"file://{theme}")
+
+
+def test_boot_capture_empty_on_fresh_box_still_applies(monkeypatch, tmp_path):
+    """No saved desktop config and no state = genuinely fresh box; keep
+    upstream's apply-on-empty so first installs still get the wallpaper."""
+    ts, theme = _smart_wallpaper_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("FEAT_WALLPAPERS", "true")
+    monkeypatch.setattr(ts, "_current_wallpapers", lambda: [])
+    monkeypatch.setattr(ts.time, "sleep", lambda _s: None)
+    applied = []
+    monkeypatch.setattr(ts, "_apply_theme_wallpaper",
+                        lambda mode: applied.append(mode) or (True, theme))
+
+    assert ts._apply_wallpaper("dark", context="install") is True
+    assert applied == ["dark"]
+    assert ts._load_wallpaper_state()["last_applied"] == _wp(f"file://{theme}")
+
+
+def test_capture_retries_before_trusting_empty(monkeypatch, tmp_path):
+    """The guard's retry window exists for the containment-restore delay;
+    it must return the first non-empty answer without burning all waits."""
+    ts, _ = _smart_wallpaper_env(monkeypatch, tmp_path)
+    seen = {"n": 0}
+
+    def flaky():
+        seen["n"] += 1
+        return [] if seen["n"] < 3 else _wp("file:///pictures/late.jpg")
+
+    monkeypatch.setattr(ts, "_current_wallpapers", flaky)
+    monkeypatch.setattr(ts.time, "sleep", lambda _s: None)
+    assert ts._capture_wallpapers_with_retry() == _wp(
+        "file:///pictures/late.jpg")
+    assert seen["n"] == 3
 
 
 # ── privilege drop + timeout on every child, honest returns ────────────
